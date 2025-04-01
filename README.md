@@ -1,5 +1,6 @@
-In `Merkle_tree.ipynb`, you can use a file named `file.txt` for the following operations:
+In `Merkle_Tree.ipynb`, you can give a file named `file.txt` .
 
+It can perform:
 1. Division of file into chunks each of size 1024
 2. Building the merle tree using hashes and can access at each level.
 3. Encrypting and Decrypting a chunk
