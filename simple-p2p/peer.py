@@ -1,9 +1,11 @@
+# Fix for peer.py - The main issue is in the _discovery_loop method
+
 import os
 import socket
 import json
 import threading
 import time
-from utils import generate_peer_id, get_file_hash
+from utils import generate_peer_id, get_file_hash, get_local_ip
 from protocol import Message, MessageType
 from config import DEFAULT_PORT, DISCOVERY_PORT, BUFFER_SIZE
 
@@ -32,20 +34,23 @@ class Peer:
         # Start threads
         self.running = True
         self.server_thread = threading.Thread(target=self._server_loop)
-        self.discovery_thread = threading.Thread(target=self._discovery_loop)
         self.server_thread.daemon = True
-        self.discovery_thread.daemon = True
         
     def start(self):
         """Start the peer services"""
         print(f"Peer {self.id} starting on port {self.port}")
         print(f"Sharing files from {self.shared_directory}")
         self.server_thread.start()
-        self.discovery_thread.start()
+        
+        # Start discovery service
+        self.discovery_service = PeerDiscovery(self.id, self.port, self.peers)
+        self.discovery_service.start()
         
     def stop(self):
         """Stop the peer services"""
         self.running = False
+        if hasattr(self, 'discovery_service'):
+            self.discovery_service.stop()
         self.server_socket.close()
         
     def _index_files(self):
@@ -158,55 +163,6 @@ class Peer:
         )
         client_sock.sendall(response.to_json().encode('utf-8'))
     
-    def _discovery_loop(self):
-        """Broadcast peer presence and listen for other peers"""
-        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        discovery_socket.bind(('0.0.0.0', DISCOVERY_PORT))
-        
-        # Start listening for broadcasts
-        listen_thread = threading.Thread(target=self._listen_for_peers, args=(discovery_socket,))
-        listen_thread.daemon = True
-        listen_thread.start()
-        
-        # Periodically broadcast presence
-        while self.running:
-            try:
-                # Broadcast presence
-                announce_msg = Message(
-                    type=MessageType.PEER_ANNOUNCE,
-                    sender=self.id,
-                    content={
-                        'port': self.port,
-                        'file_count': len(self.available_files)
-                    }
-                )
-                discovery_socket.sendto(
-                    announce_msg.to_json().encode('utf-8'), 
-                    ('<broadcast>', DISCOVERY_PORT)
-                )
-                time.sleep(60)  # Announce every minute
-            except Exception as e:
-                print(f"Discovery broadcast error: {e}")
-                time.sleep(5)
-                
-    def _listen_for_peers(self, discovery_socket):
-        """Listen for peer announcements"""
-        while self.running:
-            try:
-                data, addr = discovery_socket.recvfrom(BUFFER_SIZE)
-                message = Message.from_json(data.decode('utf-8'))
-                
-                if message.type == MessageType.PEER_ANNOUNCE and message.sender != self.id:
-                    # Add peer to known peers
-                    peer_id = message.sender
-                    peer_port = message.content.get('port', DEFAULT_PORT)
-                    self.peers[peer_id] = (addr[0], peer_port)
-                    print(f"Discovered peer: {peer_id} at {addr[0]}:{peer_port}")
-            except Exception as e:
-                print(f"Discovery listening error: {e}")
-                
     def search_files(self, query):
         """Search for files matching the query across all peers"""
         results = []
@@ -224,10 +180,11 @@ class Peer:
                 })
                 
         # Then query other peers
-        for peer_id, (ip, port) in self.peers.items():
+        for peer_id, (ip, port) in list(self.peers.items()):
             try:
                 # Connect to peer
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)  # Add timeout to prevent hanging
                 sock.connect((ip, port))
                 
                 # Send query
@@ -253,6 +210,8 @@ class Peer:
                 sock.close()
             except Exception as e:
                 print(f"Error querying peer {peer_id}: {e}")
+                # Remove unreachable peer
+                self.peers.pop(peer_id, None)
                 
         return results
         
@@ -274,6 +233,7 @@ class Peer:
         try:
             # Connect to peer
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)  # Add timeout for connection
             sock.connect((ip, port))
             
             # Send file request
@@ -328,3 +288,144 @@ class Peer:
         except Exception as e:
             print(f"Download error: {e}")
             return False
+
+
+# ---- Improved PeerDiscovery class from discovery.py ----
+
+class PeerDiscovery:
+    """Handles peer discovery using UDP broadcasts"""
+    
+    def __init__(self, peer_id, port, peer_list):
+        self.peer_id = peer_id
+        self.port = port
+        self.peer_list = peer_list  # Reference to parent's peer list
+        self.running = False
+        self.local_ip = get_local_ip()
+        
+        # Create UDP socket for discovery
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        # Set larger buffer size and bind to any available port in discovery range
+        try:
+            self.socket.bind(('0.0.0.0', DISCOVERY_PORT))
+        except OSError:
+            # If port is in use, try a different one
+            self.socket.bind(('0.0.0.0', 0))
+            print(f"Using alternate discovery port: {self.socket.getsockname()[1]}")
+        
+    def start(self):
+        """Start the discovery service"""
+        self.running = True
+        print(f"Starting peer discovery service (ID: {self.peer_id})")
+        
+        # Start listener thread
+        self.listener_thread = threading.Thread(target=self._listen_loop)
+        self.listener_thread.daemon = True
+        self.listener_thread.start()
+        
+        # Start broadcast thread
+        self.broadcast_thread = threading.Thread(target=self._broadcast_loop)
+        self.broadcast_thread.daemon = True
+        self.broadcast_thread.start()
+        
+        # Immediately announce presence
+        self._broadcast_presence()
+        
+    def stop(self):
+        """Stop the discovery service"""
+        self.running = False
+        try:
+            self.socket.close()
+        except:
+            pass
+        
+    def _listen_loop(self):
+        """Listen for peer announcements"""
+        while self.running:
+            try:
+                data, addr = self.socket.recvfrom(BUFFER_SIZE)
+                try:
+                    message = Message.from_json(data.decode('utf-8'))
+                    
+                    if message.type == MessageType.PEER_ANNOUNCE and message.sender != self.peer_id:
+                        # Add peer to known peers
+                        peer_id = message.sender
+                        peer_port = message.content.get('port', DEFAULT_PORT)
+                        
+                        # Store the actual IP we received from, not what they might claim
+                        if addr[0] not in ('0.0.0.0', '127.0.0.1'):
+                            self.peer_list[peer_id] = (addr[0], peer_port)
+                            print(f"Discovered peer: {peer_id} at {addr[0]}:{peer_port}")
+                            
+                            # Send an immediate announcement back to help with bi-directional discovery
+                            self._send_direct_announce(addr[0], DISCOVERY_PORT)
+                except json.JSONDecodeError:
+                    # Ignore invalid packets
+                    pass
+            except Exception as e:
+                if self.running:  # Only print if not caused by stopping
+                    print(f"Discovery listening error: {e}")
+                    time.sleep(1)  # Prevent tight loop on repeated errors
+                
+    def _broadcast_loop(self):
+        """Periodically broadcast presence"""
+        while self.running:
+            try:
+                self._broadcast_presence()
+                time.sleep(15)  # Announce every 15 seconds
+            except Exception as e:
+                if self.running:  # Only print if not caused by stopping
+                    print(f"Discovery broadcast error: {e}")
+                time.sleep(5)  # Wait before retrying
+    
+    def _broadcast_presence(self):
+        """Broadcast peer presence to the network"""
+        try:
+            # Create the announcement message
+            announce_msg = Message(
+                type=MessageType.PEER_ANNOUNCE,
+                sender=self.peer_id,
+                content={
+                    'port': self.port,
+                    'timestamp': time.time(),
+                    'file_count': len(self.peer_list)
+                }
+            )
+            
+            # Send to broadcast address
+            encoded_msg = announce_msg.to_json().encode('utf-8')
+            
+            # Try different broadcast addresses
+            broadcast_addresses = [
+                '<broadcast>',  # Generic broadcast
+                '255.255.255.255',  # Global broadcast
+                '.'.join(self.local_ip.split('.')[:3] + ['255'])  # Subnet broadcast
+            ]
+            
+            for addr in broadcast_addresses:
+                try:
+                    self.socket.sendto(encoded_msg, (addr, DISCOVERY_PORT))
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error broadcasting presence: {e}")
+    
+    def _send_direct_announce(self, target_ip, target_port):
+        """Send a direct announcement to a specific IP"""
+        try:
+            announce_msg = Message(
+                type=MessageType.PEER_ANNOUNCE,
+                sender=self.peer_id,
+                content={
+                    'port': self.port,
+                    'timestamp': time.time(),
+                    'direct': True
+                }
+            )
+            
+            encoded_msg = announce_msg.to_json().encode('utf-8')
+            self.socket.sendto(encoded_msg, (target_ip, target_port))
+        except Exception as e:
+            print(f"Error sending direct announcement: {e}")
