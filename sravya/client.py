@@ -95,13 +95,14 @@ class Peer:
                     filepath = self.available_files[file_hash]
                     filename = os.path.basename(filepath)
                     filesize = os.path.getsize(filepath)
-                    merkle_root, _ = self.calculate_merkle_root(filepath)
+                    merkle_root, level_hashes = self.calculate_merkle_root(filepath)
                     
                     response = {
                         "status": "ok",
                         "filename": filename,
                         "filesize": filesize,
-                        "merkle_root": merkle_root
+                        "merkle_root": merkle_root,
+                        "level_hashes": level_hashes  # Include full merkle tree data
                     }
                 else:
                     response = {
@@ -300,19 +301,23 @@ class Peer:
                     
         return all_files
     
-    # Modified Merkle tree implementation with detailed logging
     def chunk_file(self, file_path, chunk_size=1024):
         """Break a file into chunks for building the merkle tree"""
         chunks = []
+        chunk_data = []  # Store actual chunk data for verification
+        
         with open(file_path, 'rb') as f:
             chunk_num = 0
             while chunk := f.read(chunk_size):
+                # Store the actual binary chunk for potential verification
+                chunk_data.append(chunk)
                 # Convert binary data to string for hashing
-                chunks.append(chunk.decode('utf-8', errors='ignore'))
+                chunk_str = chunk.decode('utf-8', errors='ignore')
+                chunks.append(chunk_str)
                 chunk_num += 1
         
         print(f"\nMerkle Tree - Chunked file into {len(chunks)} chunks")
-        return chunks if chunks else [""]  # Return at least one chunk even for empty files
+        return chunks if chunks else [""], chunk_data if chunk_data else [b""]
     
     def merkle_tree(self, chunks, level=0):
         """Create a Merkle tree from file chunks and return the root hash with level-wise logs"""
@@ -368,7 +373,7 @@ class Peer:
     def calculate_merkle_root(self, filepath, chunk_size=1024):
         """Calculate the Merkle tree root hash for a file with level-wise logging"""
         print(f"\n======== Building Merkle Tree for {os.path.basename(filepath)} ========")
-        chunks = self.chunk_file(filepath, chunk_size)
+        chunks, _ = self.chunk_file(filepath, chunk_size)
         root_hash, level_hashes = self.merkle_tree(chunks)
         
         # Summarize the Merkle tree
@@ -382,6 +387,36 @@ class Peer:
         print("===================================\n")
         
         return root_hash, level_hashes
+    
+    def compare_merkle_trees(self, source_level_hashes, calculated_level_hashes):
+        """Compare two Merkle trees and identify corrupted chunks"""
+        # First, confirm we have the same levels
+        if set(source_level_hashes.keys()) != set(calculated_level_hashes.keys()):
+            print("Error: The Merkle trees have different structures.")
+            return False, []
+        
+        # Get the lowest level (leaf nodes/chunks)
+        leaf_level = min(source_level_hashes.keys())
+        
+        # Compare the hashes at leaf level (representing file chunks)
+        source_leaf_hashes = source_level_hashes[leaf_level]
+        calc_leaf_hashes = calculated_level_hashes[leaf_level]
+        
+        # Check if we have the same number of leaf nodes
+        if len(source_leaf_hashes) != len(calc_leaf_hashes):
+            print(f"Error: Different number of chunks. Expected {len(source_leaf_hashes)}, got {len(calc_leaf_hashes)}")
+            return False, []
+        
+        # Find corrupted chunks
+        corrupted_chunks = []
+        for i, (source_hash, calc_hash) in enumerate(zip(source_leaf_hashes, calc_leaf_hashes)):
+            if source_hash != calc_hash:
+                corrupted_chunks.append(i)
+        
+        if corrupted_chunks:
+            return False, corrupted_chunks
+        else:
+            return True, []
     
     def download_file(self, file_hash, peer_id, destination):
         """Download a file from a peer with Merkle tree verification"""
@@ -420,6 +455,15 @@ class Peer:
             filename = response.get("filename")
             filesize = response.get("filesize")
             merkle_root = response.get("merkle_root")
+            source_level_hashes = response.get("level_hashes")
+            
+            # Check if level_hashes is None and handle it appropriately
+            if source_level_hashes is None:
+                print("Warning: No Merkle tree data received from peer. Will not be able to verify specific corrupted chunks.")
+                source_level_hashes = {}  # Initialize as empty dict to avoid NoneType error
+            else:
+                # Convert string keys back to integers
+                source_level_hashes = {int(k): v for k, v in source_level_hashes.items()}
             
             print(f"Downloading {filename} ({filesize} bytes)...")
             print(f"Expected Merkle root: {merkle_root}")
@@ -467,8 +511,8 @@ class Peer:
                 print(f"Incomplete download: {bytes_received}/{filesize} bytes received")
                 return False
                 
-            # Calculate the merkle root of the downloaded file
-            calculated_merkle_root, _ = self.calculate_merkle_root(destination_path)
+            # Calculate the merkle tree of the downloaded file
+            calculated_merkle_root, calculated_level_hashes = self.calculate_merkle_root(destination_path)
             
             # Verify the merkle root
             print("\n======== Merkle Tree Verification ========")
@@ -480,6 +524,30 @@ class Peer:
                 return True
             else:
                 print("✗ VERIFICATION FAILED: File integrity check failed. The file may be corrupted.")
+                
+                # Check which chunks are corrupted only if we have source_level_hashes
+                if source_level_hashes and len(source_level_hashes) > 0:
+                    integrity_ok, corrupted_chunks = self.compare_merkle_trees(source_level_hashes, calculated_level_hashes)
+                    
+                    if not integrity_ok:
+                        print(f"\n⚠️ Found {len(corrupted_chunks)} corrupted chunks:")
+                        for chunk_index in corrupted_chunks:
+                            print(f"  - Chunk #{chunk_index+1} is corrupted")
+                        
+                        # Get the chunk size used in the merkle tree creation
+                        chunk_size = 1024  # Default chunk size
+                        
+                        # Re-read the file chunks to show specifically which parts are corrupted
+                        chunks, chunk_data = self.chunk_file(destination_path, chunk_size)
+                        
+                        for chunk_index in corrupted_chunks:
+                            if chunk_index < len(chunks):
+                                start_byte = chunk_index * chunk_size
+                                end_byte = start_byte + len(chunk_data[chunk_index])
+                                print(f"  - Corrupted data at bytes {start_byte}-{end_byte-1}")
+                else:
+                    print("Unable to pinpoint corrupted chunks: No detailed Merkle tree data available")
+                
                 return False
                 
         except Exception as e:
@@ -488,6 +556,9 @@ class Peer:
         finally:
             client_socket.close()
 
+##############################################################
+##############################################
+####################################################
 def main():
     parser = argparse.ArgumentParser(description='Simple P2P File Sharing with Merkle Tree Verification')
     parser.add_argument('--port', type=int, default=8000, help='Port to listen on')
@@ -524,7 +595,8 @@ def main():
             print("4. Download a file")
             print("5. View all peer files")
             print("6. Verify file integrity")
-            print("7. Quit")
+            print("7. Simulate corrupted file transfer (test)")
+            print("8. Quit")
             
             choice = input("\nEnter your choice: ")
             
@@ -626,11 +698,86 @@ def main():
                 if not os.path.exists(filepath):
                     print("File does not exist.")
                 else:
-                    merkle_root, _ = peer.calculate_merkle_root(filepath)
+                    merkle_root, level_hashes = peer.calculate_merkle_root(filepath)
                     print(f"Merkle root hash: {merkle_root}")
                     print("File integrity can be verified by comparing this Merkle root hash with the original.")
-                
+            
             elif choice == '7':
+                print("\nSimulate corrupted file transfer (test)")
+                filepath = input("Enter the path to a file to test corruption detection: ")
+                
+                if not os.path.exists(filepath):
+                    print("File does not exist.")
+                    continue
+                
+                # Create a copy of the file
+                filename = os.path.basename(filepath)
+                corrupted_filepath = os.path.join(os.path.dirname(filepath), f"corrupted_{filename}")
+                
+                # Copy the file
+                with open(filepath, 'rb') as src, open(corrupted_filepath, 'wb') as dst:
+                    data = src.read()
+                    dst.write(data)
+                
+                # Calculate original Merkle tree
+                merkle_root, level_hashes = peer.calculate_merkle_root(filepath)
+                print(f"Original Merkle root hash: {merkle_root}")
+                
+                # Corrupt a random chunk in the copied file
+                try:
+                    chunks, chunk_data = peer.chunk_file(corrupted_filepath)
+                    chunk_size = 1024  # Default chunk size
+                    
+                    # Choose a chunk to corrupt
+                    if len(chunks) > 0:
+                        corrupt_index = int(input(f"Enter chunk number to corrupt (1-{len(chunks)}): ")) - 1
+                        
+                        if 0 <= corrupt_index < len(chunks):
+                            # Corrupt the file at the specified chunk
+                            with open(corrupted_filepath, 'r+b') as f:
+                                f.seek(corrupt_index * chunk_size)
+                                # Write some corrupted data
+                                corrupted_data = b'X' * min(chunk_size, 100)  # Corrupt up to 100 bytes
+                                f.write(corrupted_data)
+                            
+                            print(f"Corrupted chunk #{corrupt_index+1} in file: {corrupted_filepath}")
+                            
+                            # Calculate new Merkle tree for corrupted file
+                            corrupted_merkle_root, corrupted_level_hashes = peer.calculate_merkle_root(corrupted_filepath)
+                            print(f"Corrupted file's Merkle root hash: {corrupted_merkle_root}")
+                            # Compare the Merkle trees to detect corrupted chunks
+                            print("\n======== Merkle Tree Verification ========")
+                            print(f"Original Merkle root: {merkle_root}")
+                            print(f"Corrupted file Merkle root: {corrupted_merkle_root}")
+                            
+                            if corrupted_merkle_root == merkle_root:
+                                print("Unexpected: Merkle roots are identical despite corruption!")
+                            else:
+                                print("✗ VERIFICATION FAILED: Merkle roots differ as expected due to corruption")
+                                
+                                # Find the corrupted chunks
+                                integrity_ok, corrupted_chunks = peer.compare_merkle_trees(level_hashes, corrupted_level_hashes)
+                                
+                                if not integrity_ok:
+                                    print(f"\n⚠️ Found {len(corrupted_chunks)} corrupted chunks:")
+                                    for chunk_index in corrupted_chunks:
+                                        print(f"  - Chunk #{chunk_index+1} is corrupted")
+                                        
+                                    # Show byte ranges for corrupted chunks
+                                    for chunk_index in corrupted_chunks:
+                                        start_byte = chunk_index * chunk_size
+                                        # Calculate end byte based on actual chunk data
+                                        chunk_bytes = min(chunk_size, os.path.getsize(corrupted_filepath) - start_byte)
+                                        end_byte = start_byte + chunk_bytes
+                                        print(f"  - Corrupted data at bytes {start_byte}-{end_byte-1}")
+                        else:
+                            print(f"Invalid chunk index. Must be between 1 and {len(chunks)}")
+                    else:
+                        print("File has no chunks (empty file?)")
+                except Exception as e:
+                    print(f"Error during corruption simulation: {e}")
+                    
+            elif choice == '8':
                 break
                 
             else:
@@ -640,7 +787,6 @@ def main():
         print("\nShutting down...")
     finally:
         peer.stop()
-        print("Goodbye!")
 
 if __name__ == "__main__":
     main()
