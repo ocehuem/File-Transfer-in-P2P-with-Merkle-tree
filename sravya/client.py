@@ -459,7 +459,7 @@ class Peer:
             
             # Check if level_hashes is None and handle it appropriately
             if source_level_hashes is None:
-                print("Warning: No Merkle tree data received from peer. Will not be able to verify specific corrupted chunks.")
+                print("Warning: No Merkle tree data received from peer. Will proceed with root hash verification only.")
                 source_level_hashes = {}  # Initialize as empty dict to avoid NoneType error
             else:
                 # Convert string keys back to integers
@@ -492,6 +492,9 @@ class Peer:
             destination_path = os.path.join(destination, filename)
             with open(destination_path, 'wb') as f:
                 bytes_received = 0
+                start_time = time.time()
+                last_update = time.time()
+                
                 while bytes_received < filesize:
                     try:
                         chunk = data_socket.recv(4096)  # Use smaller chunks
@@ -499,7 +502,14 @@ class Peer:
                             break
                         f.write(chunk)
                         bytes_received += len(chunk)
-                        print(f"Progress: {bytes_received}/{filesize} bytes ({bytes_received/filesize*100:.1f}%)", end="\r")
+                        
+                        # Update progress periodically (not too frequently)
+                        current_time = time.time()
+                        if current_time - last_update > 0.5:  # Update every 0.5 seconds
+                            speed = bytes_received / (current_time - start_time) / 1024  # KB/s
+                            print(f"Progress: {bytes_received}/{filesize} bytes ({bytes_received/filesize*100:.1f}%) - {speed:.1f} KB/s", end="\r")
+                            last_update = current_time
+                            
                     except socket.timeout:
                         break
                 print()  # New line after progress
@@ -510,15 +520,19 @@ class Peer:
             if bytes_received < filesize:
                 print(f"Incomplete download: {bytes_received}/{filesize} bytes received")
                 return False
+            
+            # Use the same chunking method as the sender to ensure consistency
+            chunk_size = 1024  # Default chunk size - must match what the sender used
                 
-            # Calculate the merkle tree of the downloaded file
-            calculated_merkle_root, calculated_level_hashes = self.calculate_merkle_root(destination_path)
+            # Calculate the merkle tree of the downloaded file using the same method/chunk size
+            calculated_merkle_root, calculated_level_hashes = self.calculate_merkle_root(destination_path, chunk_size)
             
             # Verify the merkle root
             print("\n======== Merkle Tree Verification ========")
             print(f"Expected Merkle root: {merkle_root}")
             print(f"Calculated Merkle root: {calculated_merkle_root}")
             
+            # Fix for incorrect verification: use the server-provided merkle_root directly
             if calculated_merkle_root == merkle_root:
                 print("✓ VERIFICATION SUCCESSFUL: File integrity verified using Merkle tree!")
                 return True
@@ -527,16 +541,34 @@ class Peer:
                 
                 # Check which chunks are corrupted only if we have source_level_hashes
                 if source_level_hashes and len(source_level_hashes) > 0:
-                    integrity_ok, corrupted_chunks = self.compare_merkle_trees(source_level_hashes, calculated_level_hashes)
+                    print("\nPerforming detailed chunk verification...")
                     
-                    if not integrity_ok:
+                    # We need to ensure the level numbers match between trees
+                    # Find leaf level (lowest level number) in both trees
+                    source_leaf_level = min(source_level_hashes.keys()) if source_level_hashes else 0
+                    calc_leaf_level = min(calculated_level_hashes.keys()) if calculated_level_hashes else 0
+                    
+                    # Get the leaf hashes from both trees
+                    source_leaf_hashes = source_level_hashes.get(source_leaf_level, [])
+                    calc_leaf_hashes = calculated_level_hashes.get(calc_leaf_level, [])
+                    
+                    # Check if we have the same number of leaf nodes
+                    if len(source_leaf_hashes) != len(calc_leaf_hashes):
+                        print(f"Error: Different number of chunks. Expected {len(source_leaf_hashes)}, got {len(calc_leaf_hashes)}")
+                        return False
+                    
+                    # Find corrupted chunks
+                    corrupted_chunks = []
+                    for i, (source_hash, calc_hash) in enumerate(zip(source_leaf_hashes, calc_leaf_hashes)):
+                        if source_hash != calc_hash:
+                            corrupted_chunks.append(i)
+                    
+                    if corrupted_chunks:
                         print(f"\n⚠️ Found {len(corrupted_chunks)} corrupted chunks:")
                         for chunk_index in corrupted_chunks:
                             print(f"  - Chunk #{chunk_index+1} is corrupted")
                         
                         # Get the chunk size used in the merkle tree creation
-                        chunk_size = 1024  # Default chunk size
-                        
                         # Re-read the file chunks to show specifically which parts are corrupted
                         chunks, chunk_data = self.chunk_file(destination_path, chunk_size)
                         
@@ -545,16 +577,22 @@ class Peer:
                                 start_byte = chunk_index * chunk_size
                                 end_byte = start_byte + len(chunk_data[chunk_index])
                                 print(f"  - Corrupted data at bytes {start_byte}-{end_byte-1}")
+                    else:
+                        print("⚠️ Merkle root mismatch but no specific corrupted chunks found.")
+                        print("This could indicate a difference in chunking method or hash calculation.")
                 else:
-                    print("Unable to pinpoint corrupted chunks: No detailed Merkle tree data available")
+                    print("Detailed chunk verification not possible: No detailed Merkle tree data available")
+                    print("Try re-downloading the file or checking the connection.")
                 
+                # Since the root hash verification failed, we return False
                 return False
                 
         except Exception as e:
             print(f"Error downloading file: {e}")
             return False
         finally:
-            client_socket.close()
+            if 'client_socket' in locals():
+                client_socket.close()
 
 ##############################################################
 ##############################################
